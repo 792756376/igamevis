@@ -2295,11 +2295,10 @@ void igQtMainWindow::initAllFilters() {
             return;
         }
         if (m_linearExtrusionDialog == nullptr) {
-            // 首次打开时创建独立弹窗：非模态 + 置顶，用户点 X 才关闭；
+            // 首次打开时创建独立弹窗：非模态，用户点 X 才关闭；
             // 面板内容仍是 igQtLinearExtrusionWidget，只是宿主从左侧工具面板换成独立窗口
             m_linearExtrusionDialog = new QDialog(this);
             m_linearExtrusionDialog->setWindowTitle(QStringLiteral("线性拉伸"));
-            m_linearExtrusionDialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
             // 面板配色只作用于本弹窗：黑底白字、边框可见、字号比全局 12pt 更小。
             // 复选框必须连 ::indicator 一起显式定义：一旦给 QCheckBox 设了样式表，Qt 就不再画系统
             // 原生指示器；而全局样式里的对勾图片路径写错了（qrc 前缀是 /Ticon，样式里却写成 :/icons/…，
@@ -2397,6 +2396,8 @@ void igQtMainWindow::initAllFilters() {
             for (IGsize i = 0; i < attrs->GetNumberOfElements(); ++i) {
                 auto& attr = attrs->GetElement(i);
                 if (attr.IsNone() || !attr.pointer) { continue; }
+                // Warp By Scalar accepts only single-component point arrays.
+                if (attr.pointer->GetDimension() != 1) { continue; }
                 WarpArrayInfo info;
                 info.name = QString::fromStdString(attr.pointer->GetName());
                 info.dimension = attr.pointer->GetDimension();
@@ -2430,7 +2431,7 @@ void igQtMainWindow::initAllFilters() {
         collectPointArrays(obj, arrays);
         if (arrays.empty()) {
             showDarkFramelessMessage(QStringLiteral("按标量变形"),
-                                     QStringLiteral("当前模型没有点属性数组，无法按标量变形。\n"
+                                     QStringLiteral("当前模型没有单分量点属性数组，无法按标量变形。\n"
                                                     "可以先用「转换为点数据」把单元属性转到点上。"));
             return;
         }
@@ -4726,11 +4727,10 @@ void igQtMainWindow::initAllFilters() {
             return;
         }
         if (m_linearExtrusionDialog == nullptr) {
-            // 首次打开时创建独立弹窗：非模态 + 置顶，用户点 X 才关闭；
+            // 首次打开时创建独立弹窗：非模态，用户点 X 才关闭；
             // 面板内容仍是 igQtLinearExtrusionWidget，只是宿主从左侧工具面板换成独立窗口
             m_linearExtrusionDialog = new QDialog(this);
             m_linearExtrusionDialog->setWindowTitle(QStringLiteral("线性拉伸"));
-            m_linearExtrusionDialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
             // 面板配色只作用于本弹窗：黑底白字、边框可见、字号比全局 12pt 更小。
             // 复选框必须连 ::indicator 一起显式定义：一旦给 QCheckBox 设了样式表，Qt 就不再画系统
             // 原生指示器；而全局样式里的对勾图片路径写错了（qrc 前缀是 /Ticon，样式里却写成 :/icons/…，
@@ -5806,6 +5806,8 @@ void igQtMainWindow::initAllFilters() {
             for (IGsize i = 0; i < attrs->GetNumberOfElements(); ++i) {
                 auto& attr = attrs->GetElement(i);
                 if (attr.IsNone() || !attr.pointer) { continue; }
+                // Warp By Scalar accepts only single-component point arrays.
+                if (attr.pointer->GetDimension() != 1) { continue; }
                 WarpArrayInfo info;
                 info.name = QString::fromStdString(attr.pointer->GetName());
                 info.dimension = attr.pointer->GetDimension();
@@ -5839,7 +5841,7 @@ void igQtMainWindow::initAllFilters() {
         collectPointArrays(obj, arrays);
         if (arrays.empty()) {
             showDarkFramelessMessage(QStringLiteral("按标量变形"),
-                                     QStringLiteral("当前模型没有点属性数组，无法按标量变形。\n"
+                                     QStringLiteral("当前模型没有单分量点属性数组，无法按标量变形。\n"
                                                     "可以先用「转换为点数据」把单元属性转到点上。"));
             return;
         }
