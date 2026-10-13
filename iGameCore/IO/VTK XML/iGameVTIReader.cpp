@@ -4,18 +4,20 @@
 
 /**
  * @class   iGameVTIReader
- * @brief   iGameVTIReader's brief
+ * @brief   VTK XML ImageData(.vti) 读取器。
  */
 
 #include "iGameVTIReader.h"
+#include "iGameFileSystem.h"
 
-#include <zlib.h>
+#include <tinyxml2.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -23,7 +25,6 @@
 
 #include <iGameStructuredMesh.h>
 #include <iGameType.h>
-#include <tinyxml2.h>
 
 #undef max
 #undef min
@@ -31,252 +32,33 @@
 IGAME_NAMESPACE_BEGIN
 
 namespace {
-using ByteBuffer = std::vector<unsigned char>;
+using ByteBuffer = vtkxml::ByteBuffer;
 
-int Base64Value(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-/**
- * @brief 流式 base64 解码器。
- *
- * VTK 的 appended/binary 数据是不带换行的 base64 文本流，同一个 <AppendedData> 里会有多段，
- * 所以不能整体解码后再按 offset 索引 —— 必须从 offset 对应的字符开始就地解码。本类为此服务：
- *  - 自动跳过空白；
- *  - '=' 只作为 quartet 内的补位字符（2 个补位出 1 字节，1 个补位出 2 字节），
- *    **不作为输入结束**：VTK 写压缩块时会把「压缩头 + 各块长度表」和「压缩数据」分别做一次
- *    base64 编码，因此补齐符会出现在同一数据块的中间（3DMatrix.vti 的 vtkValidPointMask 就是这样）。
- *    若把 '=' 当成结束，后面的压缩数据会被丢掉，导致该块 zlib 流被截断、解压失败；
- *  - 遇 '\0' 或 '<'（结束标签）才算输入结束。
- */
-class Base64Stream {
-public:
-    explicit Base64Stream(const char* text) : m_Pos(text) {}
-
-    /* 持续解码，直到 out 至少含 atLeastBytes 个字节，或输入结束。 */
-    void DecodeTo(IGsize atLeastBytes, ByteBuffer& out) {
-        if (m_Pos == nullptr || m_Finished) { return; }
-        while (out.size() < atLeastBytes) {
-            const char c = *m_Pos;
-            if (c == '\0' || c == '<') {
-                m_Finished = true;
-                break;
-            }
-            if (c == '=') {
-                m_Quartet[m_Count++] = 0;
-                ++m_Padding;
-            } else {
-                const int value = Base64Value(c);
-                if (value < 0) { // 空白等无关字符
-                    ++m_Pos;
-                    continue;
-                }
-                m_Quartet[m_Count++] = value;
-            }
-            ++m_Pos;
-
-            if (m_Count == 4) {
-                out.push_back(static_cast<unsigned char>((m_Quartet[0] << 2) | (m_Quartet[1] >> 4)));
-                if (m_Padding < 2) {
-                    out.push_back(static_cast<unsigned char>(((m_Quartet[1] & 0x0f) << 4) | (m_Quartet[2] >> 2)));
-                }
-                if (m_Padding < 1) {
-                    out.push_back(static_cast<unsigned char>(((m_Quartet[2] & 0x03) << 6) | m_Quartet[3]));
-                }
-                m_Count = 0;
-                m_Padding = 0;
-            }
-        }
-    }
-
-private:
-    const char* m_Pos{nullptr};
-    int m_Quartet[4]{0, 0, 0, 0};
-    int m_Count{0};
-    int m_Padding{0};
-    bool m_Finished{false};
-};
-
-/* 翻转整数的字节序（BigEndian 数据 -> 本机字节序）。 */
+/* 把二进制数据按 T 追加到属性数组，最多追加 valueCount 个值（T 既是源元素也是目标元素类型）。
+   按本机（LittleEndian）字节序直接解释，与 iGameVTUReader/iGameVTPReader 一致。 */
 template<typename T>
-T SwapByteOrder(T value) {
-    unsigned char bytes[sizeof(T)];
-    std::memcpy(bytes, &value, sizeof(T));
-    std::reverse(bytes, bytes + sizeof(T));
-    T swapped{};
-    std::memcpy(&swapped, bytes, sizeof(T));
-    return swapped;
-}
-
-/* 按文件字节序读取一个二进制值：byte_order="LittleEndian"（缺省）直接按本机解释，
-   "BigEndian" 时翻转字节。头部字段与数组元素都用它，保证两者解释一致。 */
-template<typename T>
-T ReadBinary(const unsigned char* p, bool bigEndian) {
-    T value{};
-    std::memcpy(&value, p, sizeof(T));
-    return bigEndian ? SwapByteOrder(value) : value;
-}
-
-/* 读取压缩块头部的第 index 个字段（字段宽度由 header_type 决定，字节序由 byte_order 决定）。 */
-uint64_t ReadHeaderField(const ByteBuffer& buffer, size_t index, bool header8, bool bigEndian) {
-    const size_t unit = header8 ? sizeof(uint64_t) : sizeof(uint32_t);
-    const unsigned char* p = buffer.data() + index * unit;
-    return header8 ? ReadBinary<uint64_t>(p, bigEndian)
-                   : static_cast<uint64_t>(ReadBinary<uint32_t>(p, bigEndian));
-}
-
-/* 压缩块头部字段个数：numBlocks、blockSize、lastBlockSize、compressedSize[numBlocks]。 */
-size_t HeaderFieldCount(uint64_t numBlocks) { return static_cast<size_t>(3 + numBlocks); }
-
-/**
- * @brief 解析 vtkZLibDataCompressor 的输出。
- *
- * 头部布局（字段宽度由 VTKFile/@header_type 决定，UInt32 → 4 字节，UInt64 → 8 字节；
- *          字节序由 VTKFile/@byte_order 决定，BigEndian 时逐个字段翻转）：
- *   [0]               numBlocks        压缩块个数
- *   [1]               blockSize        每块解压后的字节数
- *   [2]               lastBlockSize    最后一块解压后的字节数
- *   [3 .. 3+n-1]      各块压缩后的字节数（与数据部分顺序一致）
- * 数据部分：numBlocks 个独立 zlib 流，逐个解压（字节流本身与字节序无关，解压后仍是文件字节序）。
- */
-bool DecompressVTKZLib(const ByteBuffer& encoded, bool header8, bool bigEndian, IGsize expectedBytes, ByteBuffer& out) {
-    const size_t unit = header8 ? sizeof(uint64_t) : sizeof(uint32_t);
-    out.clear();
-    if (encoded.size() < unit * 3) { return false; }
-
-    const uint64_t numBlocks = ReadHeaderField(encoded, 0, header8, bigEndian);
-    const uint64_t blockSize = ReadHeaderField(encoded, 1, header8, bigEndian);
-    const uint64_t lastBlockSize = ReadHeaderField(encoded, 2, header8, bigEndian);
-    // 防御损坏文件：块数不可能多于头部区本身能容纳的字段数
-    if (numBlocks == 0 || blockSize == 0 || numBlocks > encoded.size() / unit) { return false; }
-
-    const size_t headerBytes = unit * HeaderFieldCount(numBlocks);
-    if (encoded.size() < headerBytes) { return false; }
-
-    out.reserve(static_cast<size_t>((numBlocks - 1) * blockSize + lastBlockSize));
-    size_t srcOffset = headerBytes;
-    for (uint64_t block = 0; block < numBlocks; ++block) {
-        const size_t compressedSize = static_cast<size_t>(ReadHeaderField(encoded, 3 + block, header8, bigEndian));
-        const size_t expectedSize =
-                (block + 1 == numBlocks) ? static_cast<size_t>(lastBlockSize) : static_cast<size_t>(blockSize);
-        if (compressedSize == 0 || expectedSize == 0 || srcOffset + compressedSize > encoded.size()) {
-            out.clear();
-            return false;
-        }
-
-        const size_t dstOffset = out.size();
-        out.resize(dstOffset + expectedSize);
-        uLongf dstLen = static_cast<uLongf>(expectedSize);
-        const int status = uncompress(out.data() + dstOffset, &dstLen, encoded.data() + srcOffset,
-                                     static_cast<uLong>(compressedSize));
-        if (status != Z_OK || dstLen != expectedSize) {
-            out.clear();
-            return false;
-        }
-        out.resize(dstOffset + dstLen);
-        srcOffset += compressedSize;
-    }
-    return expectedBytes == 0 || out.size() == expectedBytes;
-}
-
-/**
- * @brief 从 base64 文本（内联 binary 或 appended+base64）读取一个数据块。
- *
- * 有压缩器时块内容就是压缩器输出（自描述，没有额外的字节数头）；无压缩器时块内容为
- * [字节数][数据]，字节数宽度由 header_type 决定。base64 只是文本编码层，
- * 解码出来的字节流仍按文件的 byte_order 解释，因此 bigEndian 要一路传下去。
- */
-bool ReadBase64Block(const char* text, bool header8, bool compressed, bool bigEndian, IGsize expectedBytes,
-                     ByteBuffer& payload) {
-    payload.clear();
-    if (text == nullptr) { return false; }
-
-    const size_t unit = header8 ? sizeof(uint64_t) : sizeof(uint32_t);
-    Base64Stream stream(text);
-    ByteBuffer buffer;
-
-    if (compressed) {
-        stream.DecodeTo(unit * 3, buffer);
-        if (buffer.size() < unit * 3) { return false; }
-
-        const uint64_t numBlocks = ReadHeaderField(buffer, 0, header8, bigEndian);
-        if (numBlocks == 0) { return false; }
-
-        const size_t headerBytes = unit * HeaderFieldCount(numBlocks);
-        stream.DecodeTo(headerBytes, buffer);
-        if (buffer.size() < headerBytes) { return false; }
-
-        size_t totalBytes = headerBytes;
-        for (uint64_t block = 0; block < numBlocks; ++block) {
-            const size_t compressedSize = static_cast<size_t>(ReadHeaderField(buffer, 3 + block, header8, bigEndian));
-            if (compressedSize == 0) { return false; }
-            totalBytes += compressedSize;
-        }
-        stream.DecodeTo(totalBytes, buffer);
-        if (buffer.size() < totalBytes) { return false; }
-
-        return DecompressVTKZLib(buffer, header8, bigEndian, expectedBytes, payload);
-    }
-
-    stream.DecodeTo(unit, buffer);
-    if (buffer.size() < unit) { return false; }
-    const uint64_t byteNum = ReadHeaderField(buffer, 0, header8, bigEndian);
-    // 字节数超过该数组应有的长度说明头部或 offset 有误，直接拒绝，避免越界访问
-    if (byteNum == 0 || (expectedBytes != 0 && byteNum > expectedBytes)) { return false; }
-
-    stream.DecodeTo(unit + byteNum, buffer);
-    if (buffer.size() < unit + byteNum) { return false; }
-    payload.assign(buffer.begin() + unit, buffer.begin() + unit + static_cast<size_t>(byteNum));
-    return true;
-}
-
-/**
- * @brief 从 raw 文本（<AppendedData encoding="raw">）读取一个数据块。
- *
- * raw 数据直接嵌在 XML 文本里，长度必须由字节数头给出；"raw + 压缩"的组合暂不支持。
- */
-bool ReadRawBlock(const char* text, bool header8, bool compressed, bool bigEndian, IGsize expectedBytes,
-                  ByteBuffer& payload) {
-    payload.clear();
-    if (text == nullptr || compressed) { return false; }
-
-    const size_t unit = header8 ? sizeof(uint64_t) : sizeof(uint32_t);
-    const auto* bytes = reinterpret_cast<const unsigned char*>(text);
-    const uint64_t byteNum = header8 ? ReadBinary<uint64_t>(bytes, bigEndian)
-                                     : static_cast<uint64_t>(ReadBinary<uint32_t>(bytes, bigEndian));
-    if (byteNum == 0 || expectedBytes == 0 || byteNum > expectedBytes) { return false; }
-
-    payload.assign(bytes + unit, bytes + unit + static_cast<size_t>(byteNum));
-    return true;
-}
-
-/* 把二进制数据按 T 追加到属性数组，最多追加 valueCount 个值（T 既是源元素也是目标元素类型）。 */
-template<typename T>
-void AppendBytesToFlatArray(const ByteBuffer& bytes, IGsize valueCount, bool bigEndian,
-                            typename FlatArray<T>::Pointer arr) {
+void AppendBytesToFlatArray(const ByteBuffer& bytes, IGsize valueCount, typename FlatArray<T>::Pointer arr) {
     if (arr == nullptr || bytes.empty()) { return; }
     IGsize count = bytes.size() / sizeof(T);
     if (valueCount != 0 && count > valueCount) { count = valueCount; }
     arr->Reserve(count / static_cast<IGsize>(std::max(1, arr->GetDimension())));
     for (IGsize i = 0; i < count; ++i) {
-        arr->AddValue(ReadBinary<T>(bytes.data() + i * sizeof(T), bigEndian));
+        T value{};
+        std::memcpy(&value, bytes.data() + i * sizeof(T), sizeof(T));
+        arr->AddValue(value);
     }
 }
 
 /**
  * @brief 按「源元素宽度」读取整数并追加到目标整数数组。
  *
- * 目标容器按项目惯例选取（1/2/4 字节整数统一进 IntArray，8 字节进 LongLongArray），
- * 但**取值的宽度必须由 VTK 的 type 决定**，不能按目标容器宽度去读：Int8 的 1 若按 4 字节读，
- * 会变成 0x01010101 = 16843009，而且元素个数只有应有的 1/4。
+ * 取值的宽度由 VTK 的 type 决定（Int8 = 1 字节/元素），目标容器按该 type 对应的
+ * 精确数组类型选择（Int8 → CharArray、UInt8 → UnsignedCharArray、……，与
+ * iGameVTUReader::ReadIntegerDataArray 一致），不能按容器宽度去读：Int8 的 1 若按
+ * 4 字节读会变成 0x01010101 = 16843009，且元素个数只剩应有的 1/4。
  */
 template<typename TDst>
-void AppendRawIntegers(const ByteBuffer& bytes, IGsize valueCount, IGsize srcSize, bool srcUnsigned, bool bigEndian,
+void AppendRawIntegers(const ByteBuffer& bytes, IGsize valueCount, IGsize srcSize, bool srcUnsigned,
                        typename FlatArray<TDst>::Pointer arr) {
     if (arr == nullptr || srcSize == 0 || bytes.empty()) { return; }
     IGsize count = bytes.size() / srcSize;
@@ -291,19 +73,22 @@ void AppendRawIntegers(const ByteBuffer& bytes, IGsize valueCount, IGsize srcSiz
                                     : static_cast<long long>(static_cast<int8_t>(p[0]));
                 break;
             case 2: {
-                const uint16_t raw = ReadBinary<uint16_t>(p, bigEndian);
+                uint16_t raw{};
+                std::memcpy(&raw, p, sizeof(raw));
                 value = srcUnsigned ? static_cast<long long>(raw)
                                     : static_cast<long long>(static_cast<int16_t>(raw));
                 break;
             }
             case 4: {
-                const uint32_t raw = ReadBinary<uint32_t>(p, bigEndian);
+                uint32_t raw{};
+                std::memcpy(&raw, p, sizeof(raw));
                 value = srcUnsigned ? static_cast<long long>(raw)
                                     : static_cast<long long>(static_cast<int32_t>(raw));
                 break;
             }
             default: {
-                const uint64_t raw = ReadBinary<uint64_t>(p, bigEndian);
+                uint64_t raw{};
+                std::memcpy(&raw, p, sizeof(raw));
                 value = static_cast<long long>(raw);
                 break;
             }
@@ -327,10 +112,8 @@ void AppendAsciiToFlatArray(const char* text, IGsize valueCount, typename FlatAr
  * @brief 把 ascii 文本按整数类型直接解析后追加到属性数组，最多 valueCount 个值。
  *
  * 【不能复用读 double 的版本】double 只有 53 位尾数，ASCII 里的 64 位整数先读成 double
- * 再转回整数会丢精度：9007199254740993 会被读成 9007199254740992，ID / 整数标量被悄悄改值。
- * 这里按 srcUnsigned 选择 strtoll / strtoull 直接解析成 64 位整数，再窄化到目标类型。
- *
- * 解析到非整数记号时就停止：剩下的位置留给长度校验，数组不完整会被判为错误而不是静默截断。
+ * 再转回整数会丢精度。这里按 srcUnsigned 选择 strtoll / strtoull 直接解析成 64 位整数，
+ * 再窄化到目标类型。
  */
 template<typename T>
 void AppendAsciiIntegersToFlatArray(const char* text, IGsize valueCount, bool srcUnsigned,
@@ -446,6 +229,51 @@ const char* iGameVTIReader::GetAppendedDataHead() {
     return m_AppendedDataHead;
 }
 
+bool iGameVTIReader::DecodeDataArrayPayload(tinyxml2::XMLElement* element, vtkxml::ByteBuffer& output) {
+    const char* format = element != nullptr ? element->Attribute("format") : nullptr;
+    const char* appended = nullptr;
+    if (format != nullptr && std::strcmp(format, "appended") == 0) { appended = GetAppendedDataHead(); }
+
+    vtkxml::DataArrayDecodeContext context;
+    context.root = root;
+    context.appendedData = appended;
+    context.sourceData = m_MemoryBuffer;
+    context.sourceSize = m_MemoryBufferSize;
+    // raw AppendedData 需要整文件字节（按 offset 定位 '_' 之后的数据），与 iGameVTUReader 一致。
+    if (format != nullptr && std::strcmp(format, "appended") == 0 && m_RawAppendedData &&
+        (context.sourceData == nullptr || context.sourceSize == 0)) {
+        if (m_DataArraySourceBuffer.empty()) {
+            std::ifstream stream(FileSystem::PathFromUtf8(m_FilePath), std::ios::binary | std::ios::ate);
+            if (!stream) {
+                IGAME_CORE_ERROR("[iGameVTIReader] cannot open the source file for raw AppendedData.");
+                return false;
+            }
+            const std::streamsize size = stream.tellg();
+            if (size <= 0) {
+                IGAME_CORE_ERROR("[iGameVTIReader] cannot determine the raw AppendedData source size.");
+                return false;
+            }
+            m_DataArraySourceBuffer.resize(static_cast<std::size_t>(size));
+            stream.seekg(0, std::ios::beg);
+            if (!stream.read(m_DataArraySourceBuffer.data(), size)) {
+                m_DataArraySourceBuffer.clear();
+                IGAME_CORE_ERROR("[iGameVTIReader] cannot read the source file for raw AppendedData.");
+                return false;
+            }
+        }
+        context.sourceData = m_DataArraySourceBuffer.data();
+        context.sourceSize = m_DataArraySourceBuffer.size();
+    }
+
+    std::string error;
+    if (!vtkxml::DecodeDataArray(element, context, output, error)) {
+        const char* name = element != nullptr ? element->Attribute("Name") : nullptr;
+        IGAME_CORE_ERROR("[iGameVTIReader] DataArray '{}': {}.", name != nullptr ? name : "<unnamed>", error);
+        return false;
+    }
+    return true;
+}
+
 bool iGameVTIReader::ReadImageDataInfo() {
     auto* elem = FindTargetItem(root, "ImageData");
     if (elem == nullptr) {
@@ -521,12 +349,6 @@ bool iGameVTIReader::ReadOneArray(tinyxml2::XMLElement* elem, IGenum attachmentT
     const int components = data != nullptr ? std::max(1, std::atoi(data)) : 1;
 
     const bool ascii = (format == nullptr) || (std::strcmp(format, "ascii") == 0);
-    const bool binary = (format != nullptr) && (std::strcmp(format, "binary") == 0);
-    const bool appended = (format != nullptr) && (std::strcmp(format, "appended") == 0);
-    if (!ascii && !binary && !appended) {
-        IGAME_CORE_ERROR("[iGameVTIReader] Unsupported format '{}' of array '{}'.", format, name);
-        return false;
-    }
 
     // 该段没有元组时（例如无单元的网格同样带 <CellData> 节点）没有任何数据需要读取
     if (tupleNum == 0) { return true; }
@@ -540,8 +362,8 @@ bool iGameVTIReader::ReadOneArray(tinyxml2::XMLElement* elem, IGenum attachmentT
     }
     const IGsize valueNum = tupleNum * static_cast<IGsize>(components);
 
-    // 源元素宽度/符号性由 VTK 的 type 决定（Int8 = 1 字节/元素）；容器类型另按项目惯例选，
-    // 两者不能混为一谈，否则 Int8 的 1 会被按 4 字节读成 0x01010101 = 16843009。
+    // 源元素宽度/符号性由 VTK 的 type 决定（Int8 = 1 字节/元素）；容器类型另按 type
+    // 对应的精确数组类型选择，两者不能混为一谈。
     const IGsize srcSize = SizeOfVtkType(type);
     const bool srcUnsigned = IsUnsignedVtkType(type);
 
@@ -553,24 +375,7 @@ bool iGameVTIReader::ReadOneArray(tinyxml2::XMLElement* elem, IGenum attachmentT
 
     ByteBuffer bytes;
     if (!ascii) {
-        bool ok = false;
-        if (binary) {
-            ok = ReadBase64Block(elem->GetText(), m_Header_8_byte_flag, m_Compressed, m_BigEndian, byteNum, bytes);
-        } else {
-            const char* offsetText = elem->Attribute("offset");
-            const char* head = GetAppendedDataHead();
-            if (offsetText != nullptr && head != nullptr) {
-                const char* block = head + std::atoll(offsetText);
-                ok = m_RawAppendedData
-                             ? ReadRawBlock(block, m_Header_8_byte_flag, m_Compressed, m_BigEndian, byteNum, bytes)
-                             : ReadBase64Block(block, m_Header_8_byte_flag, m_Compressed, m_BigEndian, byteNum, bytes);
-            }
-        }
-        if (!ok) {
-            IGAME_CORE_ERROR("[iGameVTIReader] Failed to decode array '{}' (format='{}', type='{}').", name,
-                             format != nullptr ? format : "ascii", type != nullptr ? type : "Float32");
-            return false;
-        }
+        if (!DecodeDataArrayPayload(elem, bytes)) { return false; }
         // 解码出的字节数必须与 DataArray 声明的元组数完全一致：字节数偏少时数组不完整，
         // 若只告警继续，后续滤波会按点索引读到不存在的元素。
         if (bytes.size() != byteNum) {
@@ -580,33 +385,79 @@ bool iGameVTIReader::ReadOneArray(tinyxml2::XMLElement* elem, IGenum attachmentT
         }
     }
 
-    // 容器类型按项目惯例选择：浮点 → Float/Double，8 字节整数 → LongLong，其余整数 → Int；
+    // 容器类型按 VTK type 选择（与 iGameVTUReader::ReadIntegerDataArray 一致）：
+    // Int8 → CharArray、UInt8 → UnsignedCharArray、Int16 → ShortArray、UInt16 → UnsignedShortArray、
+    // Int32 → IntArray、UInt32 → UnsignedIntArray、Int64 → LongLongArray、UInt64 → UnsignedLongLongArray。
     // 取值时统一按上面的 srcSize/srcUnsigned 逐个元素读取。
     ArrayObject::Pointer array;
     if (IsFloat64VtkType(type)) {
         DoubleArray::Pointer typed = DoubleArray::New();
         typed->SetDimension(components);
         ascii ? AppendAsciiToFlatArray<double>(elem->GetText(), valueNum, typed)
-              : AppendBytesToFlatArray<double>(bytes, valueNum, m_BigEndian, typed);
+              : AppendBytesToFlatArray<double>(bytes, valueNum, typed);
         array = typed;
     } else if (IsFloatVtkType(type)) {
         FloatArray::Pointer typed = FloatArray::New();
         typed->SetDimension(components);
         ascii ? AppendAsciiToFlatArray<float>(elem->GetText(), valueNum, typed)
-              : AppendBytesToFlatArray<float>(bytes, valueNum, m_BigEndian, typed);
+              : AppendBytesToFlatArray<float>(bytes, valueNum, typed);
         array = typed;
-    } else if (srcSize == 8) {
-        LongLongArray::Pointer typed = LongLongArray::New();
-        typed->SetDimension(components);
-        ascii ? AppendAsciiIntegersToFlatArray<long long>(elem->GetText(), valueNum, srcUnsigned, typed)
-              : AppendRawIntegers<long long>(bytes, valueNum, srcSize, srcUnsigned, m_BigEndian, typed);
-        array = typed;
+    } else if (srcSize == 1) {
+        if (srcUnsigned) {
+            UnsignedCharArray::Pointer typed = UnsignedCharArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<unsigned char>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<unsigned char>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        } else {
+            CharArray::Pointer typed = CharArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<char>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<char>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        }
+    } else if (srcSize == 2) {
+        if (srcUnsigned) {
+            UnsignedShortArray::Pointer typed = UnsignedShortArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<unsigned short>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<unsigned short>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        } else {
+            ShortArray::Pointer typed = ShortArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<short>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<short>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        }
+    } else if (srcSize == 4) {
+        if (srcUnsigned) {
+            UnsignedIntArray::Pointer typed = UnsignedIntArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<unsigned int>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<unsigned int>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        } else {
+            IntArray::Pointer typed = IntArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<int>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<int>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        }
     } else {
-        IntArray::Pointer typed = IntArray::New();
-        typed->SetDimension(components);
-        ascii ? AppendAsciiIntegersToFlatArray<int>(elem->GetText(), valueNum, srcUnsigned, typed)
-              : AppendRawIntegers<int>(bytes, valueNum, srcSize, srcUnsigned, m_BigEndian, typed);
-        array = typed;
+        if (srcUnsigned) {
+            UnsignedLongLongArray::Pointer typed = UnsignedLongLongArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<unsigned long long>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<unsigned long long>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        } else {
+            LongLongArray::Pointer typed = LongLongArray::New();
+            typed->SetDimension(components);
+            ascii ? AppendAsciiIntegersToFlatArray<long long>(elem->GetText(), valueNum, srcUnsigned, typed)
+                  : AppendRawIntegers<long long>(bytes, valueNum, srcSize, srcUnsigned, typed);
+            array = typed;
+        }
     }
 
     // 长度校验：值个数必须与元组数 × 分量数完全一致，不完整的数据一律拒绝，
@@ -651,22 +502,6 @@ bool iGameVTIReader::ReadAttributes(tinyxml2::XMLElement* section, IGenum attach
 }
 
 bool iGameVTIReader::Parsing() {
-    const char* attribute = root->Attribute("header_type");
-    if (attribute != nullptr && std::strcmp(attribute, "UInt64") == 0) { m_Header_8_byte_flag = true; }
-    attribute = root->Attribute("compressor");
-    if (attribute != nullptr && std::strncmp(attribute, "vtkZLibDataCompressor", 21) == 0) { m_Compressed = true; }
-    // 字节序：缺省 LittleEndian；BigEndian 时头部字段与数组元素都要翻转字节，
-    // 否则会被按本机字节序误读（头部解析出错 -> 数组被丢弃，却仍然报告读取成功）
-    attribute = root->Attribute("byte_order");
-    if (attribute != nullptr) {
-        if (std::strcmp(attribute, "BigEndian") == 0) {
-            m_BigEndian = true;
-        } else if (std::strcmp(attribute, "LittleEndian") != 0) {
-            IGAME_CORE_ERROR("[iGameVTIReader] Unsupported byte_order '{}'.", attribute);
-            return false;
-        }
-    }
-
     if (!ReadImageDataInfo()) { return false; }
     UpdateProgress(0.1);
 

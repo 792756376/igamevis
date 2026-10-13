@@ -7,13 +7,15 @@
  *          PointData / CellData 中的每个 <DataArray> → 一条属性（IG_TENSOR / IG_VECTOR /
  *          IG_NORMAL / IG_SCALAR）。
  *
- *          支持的数据编码：ascii、binary(base64 内联)、appended + base64、appended + raw(未压缩)；
- *          compressor="vtkZLibDataCompressor" 时按 VTK 的压缩块格式解压。
+ *          数据编码（ascii / binary / appended+base64 / appended+raw / vtkZLibDataCompressor）
+ *          统一交给共享解码器 iGameVTKXMLDataArrayDecoder 处理，与 iGameVTUReader /
+ *          iGameVTPReader 保持一致。
  */
 #ifndef iGameVTIReader_h
 #define iGameVTIReader_h
 
 #include "XML/iGameXMLFileReader.h"
+#include "iGameVTKXMLDataArrayDecoder.h"
 
 #include <string>
 #include <vector>
@@ -54,6 +56,9 @@ private:
     /* <AppendedData> 中数据区起始指针（跳过 '_'）。 */
     const char* GetAppendedDataHead();
 
+    /* 用共享解码器把 binary / appended DataArray 解成未压缩字节。 */
+    bool DecodeDataArrayPayload(tinyxml2::XMLElement* element, vtkxml::ByteBuffer& output);
+
 private:
     igIndex m_PointSize[3]{1, 1, 1};         // 各方向点数（Piece/WholeExtent）
     igIndex m_Extent[6]{0, 0, 0, 0, 0, 0};   // Piece Extent，用于隐含坐标的起点偏移
@@ -62,11 +67,9 @@ private:
     IGsize m_PointNum{0};
     IGsize m_CellNum{0};
 
-    bool m_Header_8_byte_flag{false};   // VTKFile/@header_type == "UInt64"
-    bool m_Compressed{false};           // 存在 VTKFile/@compressor
-    bool m_BigEndian{false};            // VTKFile/@byte_order == "BigEndian"
     bool m_RawAppendedData{false};      // <AppendedData encoding="raw">
     const char* m_AppendedDataHead{nullptr};
+    std::vector<char> m_DataArraySourceBuffer;  // raw AppendedData 的整文件字节（懒加载）
 
     // <PointData>/<CellData> 上的 Tensors/Normals/Vectors 名字列表（决定属性类型）
     std::vector<std::string> m_TensorNames;
