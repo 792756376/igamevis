@@ -5604,38 +5604,92 @@ void igQtMainWindow::initAllFilters() {
         const QString title = QStringLiteral("随机属性生成");
         auto input = currentFilterInput(title);
         if (!input) return;
-        auto* dialog = new igQtFilterDialogDockWidget(this, true);
+        igQtFilterDialogDockWidget* dialog = new igQtFilterDialogDockWidget(this, true);
         dialog->setFilterTitle(title);
-        const int minimum = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("下限"), "0");
-        const int maximum = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("上限"), "1");
-        const int seed = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("随机种子"), "1");
-        const int association = dialog->addParameter(igQtFilterDialogDockWidget::QT_COMBO_BOX,
-                QStringLiteral("位置"), std::vector<QString>{QStringLiteral("点"), QStringLiteral("单元")});
-        const int dataType = dialog->addParameter(igQtFilterDialogDockWidget::QT_COMBO_BOX,
-                QStringLiteral("数据类型"), std::vector<QString>{"char", "uchar", "short", "ushort", "int", "uint", "int64", "uint64", "float", "double"});
-        const int name = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("属性名（可选）"), "");
+        dialog->setFixedWidth(580);
+
+        // 数据类型下拉框（10 种，与核心 Filter 支持一致）
+        const int dataTypeId = dialog->addParameter(
+                igQtFilterDialogDockWidget::QT_COMBO_BOX, QStringLiteral("数据类型 (Data Type)"),
+                std::vector<QString>{QStringLiteral("Float"), QStringLiteral("Double"), QStringLiteral("Int"),
+                        QStringLiteral("Unsigned Int"), QStringLiteral("Char"), QStringLiteral("Unsigned Char"),
+                        QStringLiteral("Short"), QStringLiteral("Unsigned Short"), QStringLiteral("Long Long"),
+                        QStringLiteral("Unsigned Long Long")});
+        const int minId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("最小值 (Minimum)"), "0");
+        const int maxId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("最大值 (Maximum)"), "255");
+
+        // 挂载位置下拉框（Point / Cell）
+        const int attachId = dialog->addParameter(igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                QStringLiteral("挂载位置 (Attach To)"),
+                std::vector<QString>{QStringLiteral("点 (Point)"), QStringLiteral("面/单元 (Cell)")});
+        const int seedId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("随机种子 (Seed)"), "0");
+
+        // 数组名称 + 同名冲突处理
+        const int attrNameId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("数组名称 (Attribute Name)"),
+                QStringLiteral("RandomPointScalars"));
+        const int conflictId = dialog->addParameter(igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                QStringLiteral("同名处理 (Name Conflict)"),
+                std::vector<QString>{QStringLiteral("追加 (Append)"),
+                        QStringLiteral("替换 (Replace)"),
+                        QStringLiteral("自动改名 (Auto Rename)")});
         dialog->show();
         dialog->setApplyFunctor([=, this]() {
-            bool ok[5]{};
-            const double lo = dialog->getDouble(minimum, ok[0]), hi = dialog->getDouble(maximum, ok[1]);
-            const int valueSeed = dialog->getInt(seed, ok[2]);
-            const int attach = dialog->getComboIndex(association, ok[3]);
-            const int kind = dialog->getComboIndex(dataType, ok[4]);
-            if (!ok[0] || !ok[1] || !ok[2] || !ok[3] || !ok[4] || lo > hi || valueSeed < 0 || kind < 0 || kind >= 10) {
-                showDarkFramelessMessage(title, QStringLiteral("随机属性参数无效。")); return;
+            bool ok{};
+            static const int kTypes[] = {
+                    IG_FLOAT, IG_DOUBLE, IG_INT, IG_UNSIGNED_INT, IG_CHAR, IG_UNSIGNED_CHAR,
+                    IG_SHORT, IG_UNSIGNED_SHORT, IG_LONG_LONG, IG_UNSIGNED_LONG_LONG};
+            const int typeIdx = dialog->getComboIndex(dataTypeId, ok);
+            const double lo = dialog->getDouble(minId, ok);
+            const double hi = dialog->getDouble(maxId, ok);
+            const int attachIdx = dialog->getComboIndex(attachId, ok);
+            const unsigned int seed = static_cast<unsigned int>(dialog->getInt(seedId, ok));
+            const int conflictIdx = dialog->getComboIndex(conflictId, ok);
+            if (!ok || typeIdx < 0 || typeIdx >= 10 || lo > hi || seed < 0) {
+                showDarkFramelessMessage(title, QStringLiteral("随机属性参数无效。"));
+                dialog->close();
+                return;
             }
-            const IGenum kinds[] = {IG_CHAR, IG_UNSIGNED_CHAR, IG_SHORT, IG_UNSIGNED_SHORT,
-                    IG_INT, IG_UNSIGNED_INT, IG_LONG_LONG, IG_UNSIGNED_LONG_LONG, IG_FLOAT, IG_DOUBLE};
-            auto filter = RandomAttributesFilter::New();
+            std::string attrName;
+            if (auto nameEdit = dynamic_cast<QLineEdit*>(dialog->getWidget(attrNameId))) {
+                attrName = nameEdit->text().trimmed().toStdString();
+            }
+            RandomAttributesFilter::Pointer filter = RandomAttributesFilter::New();
             filter->SetInput(input);
             filter->SetRange(lo, hi);
-            filter->SetSeed(static_cast<unsigned int>(valueSeed));
-            filter->SetAttachmentType(attach == 0 ? IG_POINT : IG_CELL);
-            filter->SetDataType(kinds[kind]);
-            auto* edit = qobject_cast<QLineEdit*>(dialog->getWidget(name));
-            if (edit && !edit->text().isEmpty()) filter->SetAttributeName(edit->text().toStdString());
-            if (!filter->Execute()) { showDarkFramelessMessage(title, QString::fromStdString(filter->GetMessage())); return; }
-            refreshFilterResult(input, filter->GetOutput(), title);
+            filter->SetDataType(kTypes[typeIdx]);
+            filter->SetAttachmentType(attachIdx == 0 ? IG_POINT : IG_CELL);
+            filter->SetSeed(seed);
+            if (!attrName.empty()) filter->SetAttributeName(attrName);
+            switch (conflictIdx) {
+            case 1: filter->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::Replace); break;
+            case 2: filter->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::AutoRename); break;
+            default: filter->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::Append); break;
+            }
+            if (!filter->Execute()) {
+                showDarkFramelessMessage(title, QString::fromStdString(filter->GetMessage()));
+                dialog->close();
+                return;
+            }
+            // 核心已生成独立输出，直接使用
+            auto rawOut = filter->GetOutput();
+            if (!rawOut) { dialog->close(); return; }
+            // 模型节点名兜底：无名 → RandomAttrResult；有名 → 原名 + 后缀
+            rawOut->SetName(rawOut->GetName().empty() ? std::string("RandomAttrResult")
+                                                      : rawOut->GetName() + " (RandomAttr)");
+            modelTreeWidget->addDataObjectToModelTree(rawOut, Algorithm);
+            // 执行后选中结果，默认按新随机数组着色
+            if (auto drawObj = DynamicCast<DrawObject>(rawOut)) {
+                auto outAttrSet = rawOut->GetAttributeSet();
+                int idx = outAttrSet ? outAttrSet->GetAttributeIndex(
+                        attrName.empty() ? "RandomPointScalars" : attrName) : -1;
+                if (idx < 0 && outAttrSet) idx = (int)outAttrSet->GetNumberOfAttributes() - 1;
+                if (idx >= 0) drawObj->ViewCloudPicture(rendererWidget->GetScene(), idx, 0);
+            }
+            rendererWidget->update();
             dialog->close();
         });
     });
@@ -5670,37 +5724,144 @@ void igQtMainWindow::initAllFilters() {
         const QString title = QStringLiteral("法向偏转");
         auto input = currentFilterInput(title);
         if (!input) return;
-        auto* dialog = new igQtFilterDialogDockWidget(this, true);
+        igQtFilterDialogDockWidget* dialog = new igQtFilterDialogDockWidget(this, true);
         dialog->setFilterTitle(title);
-        const int field = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
-                QStringLiteral("向量属性名"), "");
-        const int strength = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
-                QStringLiteral("偏转强度"), "1");
-        const int useNormal = dialog->addParameter(igQtFilterDialogDockWidget::QT_CHECK_BOX,
-                QStringLiteral("使用指定基准法向"), "false");
-        const int nx = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("基准 X"), "0");
-        const int ny = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("基准 Y"), "0");
-        const int nz = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("基准 Z"), "1");
+        dialog->setFixedWidth(640);
+
+        // 向量场所在位置（自动 / 点 / 单元）：显式指定，避免同名属性取错
+        const int vfAttachId = dialog->addParameter(
+                igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                QStringLiteral("向量场所在位置 (Vector Field Location)"),
+                std::vector<QString>{QStringLiteral("自动 Auto (Point -> Cell 兜底)"),
+                        QStringLiteral("点数据 Point Data"),
+                        QStringLiteral("单元/面数据 Cell Data")});
+        // 向量场下拉框（按位置联动筛选，显示带位置标记，userData 存纯名称）
+        const int vecFieldId = dialog->addParameter(
+                igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                QStringLiteral("向量场 (Vector Field)"), std::vector<QString>{QStringLiteral("(请选择)")});
+
+        auto attrSet = input->GetAttributeSet();
+        auto* vecCombo = dynamic_cast<QComboBox*>(dialog->getWidget(vecFieldId));
+        auto refreshVectorFields = [vecCombo, attrSet](int locationFilter) {
+            if (!vecCombo) return;
+            vecCombo->clear();
+            if (!attrSet) { vecCombo->addItem(QStringLiteral("(无可用向量属性)")); return; }
+            bool found = false;
+            for (size_t i = 0; i < attrSet->GetNumberOfAttributes(); ++i) {
+                auto& attr = attrSet->GetAttribute(i);
+                if (!attr.pointer || attr.isDeleted || attr.pointer->GetDimension() != 3) continue;
+                if (locationFilter == 1 && attr.attachmentType != IG_POINT) continue;
+                if (locationFilter == 2 && attr.attachmentType != IG_CELL) continue;
+                QString name = QString::fromStdString(attr.pointer->GetName());
+                QString tag = (attr.attachmentType == IG_POINT) ? QStringLiteral(" (Point)")
+                                                               : QStringLiteral(" (Cell)");
+                vecCombo->addItem(name + tag, name);
+                found = true;
+            }
+            if (!found) vecCombo->addItem(QStringLiteral("(无可用向量属性)"));
+        };
+        refreshVectorFields(0);
+        if (auto* vfCombo = dynamic_cast<QComboBox*>(dialog->getWidget(vfAttachId))) {
+            connect(vfCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    refreshVectorFields);
+        }
+
+        const int strengthId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("偏转强度 (Scale Factor)"), "1.0");
+        const int useUserNormalId = dialog->addParameter(igQtFilterDialogDockWidget::QT_CHECK_BOX,
+                QStringLiteral("使用自定义法向 (Use User Normal)"), "false");
+        const int normalXId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("法向 X (Normal X)"), "0");
+        const int normalYId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("法向 Y (Normal Y)"), "0");
+        const int normalZId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("法向 Z (Normal Z)"), "1");
+
         dialog->show();
         dialog->setApplyFunctor([=, this]() {
-            auto* edit = qobject_cast<QLineEdit*>(dialog->getWidget(field));
-            bool ok[5]{};
-            const double value = dialog->getDouble(strength, ok[0]);
-            const bool specified = dialog->getChecked(useNormal, ok[1]);
-            const double x = dialog->getDouble(nx, ok[2]), y = dialog->getDouble(ny, ok[3]),
-                         z = dialog->getDouble(nz, ok[4]);
-            if (!edit || edit->text().trimmed().isEmpty() || !ok[0] || !ok[1] ||
-                (specified && (!ok[2] || !ok[3] || !ok[4]))) {
-                showDarkFramelessMessage(title, QStringLiteral("请填写向量属性与有效参数。")); return;
+            bool ok{};
+            auto combo = dynamic_cast<QComboBox*>(dialog->getWidget(vecFieldId));
+            if (!combo || combo->currentText() == QStringLiteral("(无可用向量属性)") ||
+                combo->currentText() == QStringLiteral("(请选择)")) {
+                showDarkFramelessMessage(QStringLiteral("缺少向量场"),
+                                         QStringLiteral("请先选择一个 3 分量的向量属性。"));
+                return;
             }
-            auto filter = DeflectNormalsFilter::New();
+            QString fieldName = combo->currentData().toString();
+            if (fieldName.isEmpty()) fieldName = combo->currentText();
+            const int attachIdx = dialog->getComboIndex(vfAttachId, ok);
+            IGenum vfAttach = IG_NONE;
+            if (attachIdx == 1) vfAttach = IG_POINT;
+            else if (attachIdx == 2) vfAttach = IG_CELL;
+            const double strength = dialog->getDouble(strengthId, ok);
+            const bool useUserNormal = dialog->getChecked(useUserNormalId, ok);
+            const double nx = dialog->getDouble(normalXId, ok);
+            const double ny = dialog->getDouble(normalYId, ok);
+            const double nz = dialog->getDouble(normalZId, ok);
+
+            DeflectNormalsFilter::Pointer filter = DeflectNormalsFilter::New();
             filter->SetInput(input);
-            filter->SetAttributeByName(edit->text().trimmed().toStdString());
-            filter->SetDeflectStrength(static_cast<float>(value));
-            filter->SetUseUserNormal(specified);
-            if (specified) filter->SetUserNormal(x, y, z);
-            if (!filter->Execute()) { showDarkFramelessMessage(title, QString::fromStdString(filter->GetMessage())); return; }
-            refreshFilterResult(input, filter->GetOutput(), title);
+            filter->SetAttributeByName(fieldName.toStdString());
+            filter->SetVectorFieldAttachment(vfAttach);
+            filter->SetDeflectStrength(static_cast<float>(strength));
+            filter->SetUseUserNormal(useUserNormal);
+            filter->SetUserNormal(nx, ny, nz);
+            if (!filter->Execute()) {
+                showDarkFramelessMessage(QStringLiteral("执行出错"),
+                                         QString::fromStdString(filter->GetMessage()));
+                dialog->close();
+                return;
+            }
+            // 界面明确显示基准法向来源
+            QString baseSrc = QString::fromStdString(filter->GetBaseNormalSource());
+            showDarkFramelessMessage(QStringLiteral("基准法向来源"),
+                                     baseSrc.isEmpty() ? QStringLiteral("未知") : baseSrc);
+            // 核心已生成独立输出，直接使用
+            auto rawOut = filter->GetOutput();
+            if (!rawOut) { dialog->close(); return; }
+            // 模型节点名兜底：无名 → DeflectResult；有名 → 原名 + 后缀
+            rawOut->SetName(rawOut->GetName().empty() ? std::string("DeflectResult")
+                                                      : rawOut->GetName() + " (Deflect)");
+            modelTreeWidget->addDataObjectToModelTree(rawOut, Algorithm);
+
+            // 执行后提供“法向显示模式”切换框（偏转法向 / 几何法向）
+            QDialog* displayDlg = new QDialog(this);
+            displayDlg->setWindowTitle(QStringLiteral("法向显示模式 (Display Normal)"));
+            displayDlg->setFixedWidth(440);
+            auto* dlay = new QVBoxLayout(displayDlg);
+            dlay->addWidget(new QLabel(QStringLiteral("显示法向 (Display Normal):"), displayDlg));
+            auto* modeCombo = new QComboBox(displayDlg);
+            modeCombo->addItems({QStringLiteral("使用偏转法向 (Deflected)"),
+                                 QStringLiteral("使用几何法向 (Geometric)")});
+            dlay->addWidget(modeCombo);
+
+            auto applyDisplayNormal = [this, rawOut](int mode) {
+                auto drawObj = DynamicCast<DrawObject>(rawOut);
+                if (!drawObj) return;
+                auto outAttrSet = rawOut->GetAttributeSet();
+                int idx = -1;
+                if (mode == 0) {
+                    // 偏转法向：把 DeflectedNormals 作为渲染器实际使用的光照法向，并按它着色
+                    if (outAttrSet) idx = outAttrSet->GetAttributeIndex("DeflectedNormals");
+                    if (idx >= 0) {
+                        auto nArr = DynamicCast<FloatArray>(outAttrSet->GetAttribute(idx).pointer);
+                        if (nArr) drawObj->SetLightingNormal(nArr);
+                    }
+                } else {
+                    // 几何法向：回退到几何法向，并按其着色
+                    drawObj->ClearLightingNormal();
+                    if (outAttrSet) idx = outAttrSet->GetAttributeIndex("Normals");
+                    if (idx < 0) idx = -1;
+                }
+                drawObj->ViewCloudPicture(rendererWidget->GetScene(), idx, 0);
+                drawObj->ForceReConvertToDrawableData();
+                rendererWidget->update();
+            };
+            connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    applyDisplayNormal);
+            applyDisplayNormal(modeCombo->currentIndex());
+            displayDlg->show();
+            rendererWidget->update();
             dialog->close();
         });
     });

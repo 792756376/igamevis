@@ -361,6 +361,9 @@ function(igame_register_example_test EXAMPLE_TARGET)
         elseif ("${EXAMPLE_TARGET}" STREQUAL "testLosslessEncode")
             list(APPEND _TEST_COMMAND -TimeoutSeconds 120
                 -Arguments "Models/Quad_Plane_Tensor.vtk")
+        elseif ("${EXAMPLE_TARGET}" STREQUAL "testRandomAttributes" OR
+                "${EXAMPLE_TARGET}" STREQUAL "testDeflectNormals")
+            list(APPEND _TEST_COMMAND -Arguments "--no-render")
         endif ()
         if ("${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
             # Shaders/fonts are deployed in the Examples build directory.
@@ -415,6 +418,10 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
     if ("${EXAMPLE_TARGET}" STREQUAL "testLosslessEncode")
         set(_TEST_COMMAND bash "${_TEST_SCRIPT}" "$<TARGET_FILE:${EXAMPLE_TARGET}>" 120 -- Models/Quad_Plane_Tensor.vtk)
+    endif ()
+    if ("${EXAMPLE_TARGET}" STREQUAL "testRandomAttributes" OR
+        "${EXAMPLE_TARGET}" STREQUAL "testDeflectNormals")
+        set(_TEST_COMMAND bash "${_TEST_SCRIPT}" "$<TARGET_FILE:${EXAMPLE_TARGET}>" -- --no-render)
     endif ()
 
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -712,6 +719,10 @@ igame_add_example(testReverseSenseSelfCheck Filter/ReverseSense/TestReverseSense
 
 # PerlinNoise: samples 3D Perlin noise at every input point into a point scalar array.
 igame_add_example(testPerlinNoise Filter/AttributeManipulation/TestPerlinNoise.cpp)
+
+# Random Attributes / Deflect Normals
+igame_add_example(testRandomAttributes Filter/TestRandomAttributes.cpp)
+igame_add_example(testDeflectNormals Filter/TestDeflectNormals.cpp)
 
 get_property(IGAME_EXAMPLE_TARGETS DIRECTORY PROPERTY IGAME_EXAMPLE_TARGETS)
 if (NOT IGAME_EXAMPLE_TARGETS)

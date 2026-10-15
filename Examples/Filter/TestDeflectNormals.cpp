@@ -9,6 +9,7 @@
 #include "iGameType.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 using namespace iGame;
@@ -135,7 +136,12 @@ bool runSingleTest(const char* modelPath, const char* vecAttrName,
 }
 
 
-int main() {
+int main(int argc, char* argv[]) {
+    bool noRender = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-render") == 0) noRender = true;
+    }
+
     std::printf("============================================\n");
     std::printf("  TestDeflectNormals (Improved Auto Test)\n");
     std::printf("============================================\n\n");
@@ -158,6 +164,11 @@ int main() {
     std::printf("\n============================================\n");
     std::printf("  Result: %s\n", allPass ? "ALL PASSED" : "SOME FAILED");
     std::printf("============================================\n");
+
+    // --no-render mode: skip the render window for CTest/CI runs
+    if (noRender) {
+        return allPass ? 0 : 1;
+    }
 
     // Render sphere model with deflected normals
     auto obj = iGame::FileIO::ReadFile(kModel1);

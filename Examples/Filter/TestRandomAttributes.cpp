@@ -8,6 +8,7 @@
 #include "iGameAttributeSet.h"
 #include "iGameType.h"
 #include <cstdio>
+#include <cstring>
 #include <string>
 using namespace iGame;
 
@@ -129,7 +130,12 @@ bool runSingleTest(const char* modelPath, IGenum attachType,
 }
 
 
-int main() {
+int main(int argc, char* argv[]) {
+    bool noRender = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-render") == 0) noRender = true;
+    }
+
     std::printf("============================================\n");
     std::printf("  TestRandomAttributes (Improved Auto Test)\n");
     std::printf("============================================\n\n");
@@ -152,16 +158,73 @@ int main() {
     std::printf("\n--- Test 4: StructuredGrid + CELL (2D cell count fix) ---\n");
     allPass &= runSingleTest(kModel2, IG_CELL, 0.0f, 1000.0f, 999u);
 
-    // Test 5: 同名冲突 AutoRename 模式
+    // Test 5: 同名冲突 AutoRename 模式（先注入同名数组，确保真正触发自动改名）
     std::printf("\n--- Test 5: Name conflict AutoRename ---\n");
-    allPass &= runSingleTest(kModel1, IG_POINT, 0.0f, 255.0f, 42u,
-                            "RandomPointScalars",
-                            RandomAttributesFilter::NameConflictMode::AutoRename);
+    {
+        bool ok5 = true;
+        auto mesh5 = iGame::FileIO::ReadFile(kModel1);
+        if (!mesh5) {
+            std::printf("[FAIL] failed to read %s\n", kModel1);
+            ok5 = false;
+        }
+
+        // 第一步：Append 模式生成名为 RandomPointScalars 的数组
+        auto f1 = iGame::RandomAttributesFilter::New();
+        if (ok5) {
+            f1->SetInput(mesh5);
+            f1->SetRange(0.0f, 255.0f);
+            f1->SetSeed(42u);
+            f1->SetAttachmentType(IG_POINT);
+            f1->SetAttributeName("RandomPointScalars");
+            f1->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::Append);
+            ok5 = f1->Execute();
+        }
+        auto out1 = ok5 ? f1->GetOutput() : nullptr;
+
+        // 第二步：AutoRename 模式应自动改名（RandomPointScalars_1），而非覆盖
+        auto f2 = iGame::RandomAttributesFilter::New();
+        if (out1) {
+            f2->SetInput(out1);
+            f2->SetRange(0.0f, 255.0f);
+            f2->SetSeed(43u);
+            f2->SetAttachmentType(IG_POINT);
+            f2->SetAttributeName("RandomPointScalars");
+            f2->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::AutoRename);
+            ok5 = f2->Execute();
+        } else {
+            ok5 = false;
+        }
+        auto out2 = ok5 ? f2->GetOutput() : nullptr;
+        auto as2 = out2 ? out2->GetAttributeSet() : nullptr;
+
+        if (as2 && as2->GetNumberOfAttributes() > 0) {
+            size_t totalAttrs = as2->GetNumberOfAttributes();
+            int lastIdx = (int)totalAttrs - 1;
+            auto& lastAttr = as2->GetAttribute(lastIdx);
+            auto lastArr = DynamicCast<iGame::ArrayObject>(lastAttr.pointer);
+            std::string lastName = lastArr ? lastArr->GetName() : "";
+            bool renamed = (lastName == "RandomPointScalars_1");
+            std::printf("[%s] AutoRename: totalAttrs=%zu lastName='%s' (%s)\n",
+                        renamed ? "PASS" : "FAIL",
+                        totalAttrs, lastName.c_str(),
+                        renamed ? "RENAMED" : "NOT_RENAMED");
+            ok5 = renamed;
+        } else {
+            std::printf("[FAIL] AutoRename: no output attributes\n");
+            ok5 = false;
+        }
+        allPass &= ok5;
+    }
 
     // Summary
     std::printf("\n============================================\n");
     std::printf("  Result: %s\n", allPass ? "ALL PASSED" : "SOME FAILED");
     std::printf("============================================\n");
+
+    // --no-render mode: skip the render window for CTest/CI runs
+    if (noRender) {
+        return allPass ? 0 : 1;
+    }
 
     // Render the last model with random scalars
     auto mesh = iGame::FileIO::ReadFile(kModel2);
@@ -180,7 +243,7 @@ int main() {
         auto attrSet = output->GetAttributeSet();
         if (drawObj && attrSet) {
             int idx = (int)attrSet->GetNumberOfAttributes() - 1;
-            drawObj->ViewCloudPicture(scene, idx);
+            if (idx >= 0) drawObj->ViewCloudPicture(scene, idx);
         }
 
         auto window = iGame::RenderWindow::New();
