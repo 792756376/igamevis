@@ -5636,6 +5636,25 @@ void igQtMainWindow::initAllFilters() {
                 std::vector<QString>{QStringLiteral("追加 (Append)"),
                         QStringLiteral("替换 (Replace)"),
                         QStringLiteral("自动改名 (Auto Rename)")});
+
+        // 生成类型（对齐 ParaView Random Attributes：标量 / 矢量）
+        const int genId = dialog->addParameter(igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                QStringLiteral("生成类型 (Generate)"),
+                std::vector<QString>{QStringLiteral("标量 (Scalar)"),
+                        QStringLiteral("矢量 (Vector)")});
+        // 矢量名称（留空则默认 RandomPointVectors / RandomCellVectors；仅生成矢量时显示）
+        const int vectorNameId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                QStringLiteral("矢量名称 (Vector Name)"), "");
+        // 默认生成类型为标量，初始隐藏矢量名称输入行
+        dialog->setParameterVisible(vectorNameId, false);
+        // 生成类型切换时联动显示/隐藏矢量名称
+        if (auto* genCombo = dynamic_cast<QComboBox*>(dialog->getWidget(genId))) {
+            connect(genCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [dialog, vectorNameId](int idx) {
+                        dialog->setParameterVisible(vectorNameId, idx == 1);
+                    });
+        }
+
         dialog->show();
         dialog->setApplyFunctor([=, this]() {
             bool ok{};
@@ -5648,7 +5667,8 @@ void igQtMainWindow::initAllFilters() {
             const int attachIdx = dialog->getComboIndex(attachId, ok);
             const unsigned int seed = static_cast<unsigned int>(dialog->getInt(seedId, ok));
             const int conflictIdx = dialog->getComboIndex(conflictId, ok);
-            if (!ok || typeIdx < 0 || typeIdx >= 10 || lo > hi || seed < 0) {
+            const int genIdx = dialog->getComboIndex(genId, ok);
+            if (!ok || typeIdx < 0 || typeIdx >= 10 || lo > hi || seed < 0 || genIdx < 0 || genIdx > 1) {
                 showDarkFramelessMessage(title, QStringLiteral("随机属性参数无效。"));
                 dialog->close();
                 return;
@@ -5669,6 +5689,13 @@ void igQtMainWindow::initAllFilters() {
             case 2: filter->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::AutoRename); break;
             default: filter->SetNameConflictMode(RandomAttributesFilter::NameConflictMode::Append); break;
             }
+            filter->SetGenerateKind(genIdx == 1 ? RandomAttributesFilter::GenerateKind::Vector
+                                                : RandomAttributesFilter::GenerateKind::Scalar);
+            std::string vectorName;
+            if (auto vNameEdit = dynamic_cast<QLineEdit*>(dialog->getWidget(vectorNameId))) {
+                vectorName = vNameEdit->text().trimmed().toStdString();
+            }
+            if (!vectorName.empty()) filter->SetVectorName(vectorName);
             if (!filter->Execute()) {
                 showDarkFramelessMessage(title, QString::fromStdString(filter->GetMessage()));
                 dialog->close();

@@ -21,6 +21,8 @@ using namespace iGame;
 //   2. 二维结构网格 Cell 计数修正
 //   3. 数组名称自定义 + 同名冲突处理（替换/改名/追加）
 //   4. 输入校验（min > max 的错误提示）
+//   5. 矢量生成（Generate Vectors）：固定 3 分量、元素数匹配
+//   6. 标量/矢量同时生成（Both 模式）与自定义矢量名
 //
 // 测试流程（全自动）：
 //   1) TetraMesh + IG_POINT → 验证独立输出原模型不变
@@ -28,6 +30,8 @@ using namespace iGame;
 //   3) StructuredGrid + IG_POINT → 验证点数
 //   4) StructuredGrid + IG_CELL → 验证二维结构网格 Cell 计数
 //   5) 同名冲突：AutoRename 模式测试
+//   6) TetraMesh + Vector(点/单元) → 验证 3 分量与元素数
+//   7) StructuredGrid + Both → 验证标量+矢量同时生成与自定义矢量名
 // ---------------------------------------------------------------------------
 
 static const char* kModel1 = "./Models/RandomAttributes_TetraMesh.vtk";
@@ -129,6 +133,138 @@ bool runSingleTest(const char* modelPath, IGenum attachType,
     return countOk;
 }
 
+// ---------------------------------------------------------------------------
+// runVectorTest - 矢量生成测试（改进点5/6）
+// kind 为 Vector 时验证 3 分量矢量；为 Both 时额外验证标量数组同时存在。
+// ---------------------------------------------------------------------------
+bool runVectorTest(const char* modelPath, IGenum attachType,
+                   RandomAttributesFilter::GenerateKind kind,
+                   float minVal, float maxVal, unsigned seed,
+                   const std::string& vectorName = "") {
+    const std::string attachStr = (attachType == IG_CELL) ? "CELL" : "POINT";
+    const std::string kindStr =
+            (kind == RandomAttributesFilter::GenerateKind::Both) ? "BOTH" : "VECTOR";
+
+    auto mesh = iGame::FileIO::ReadFile(modelPath);
+    if (mesh == nullptr) {
+        std::printf("[FAIL] %s: failed to read model\n", modelPath);
+        return false;
+    }
+    auto attrSet = mesh->GetAttributeSet();
+    if (attrSet == nullptr) {
+        std::printf("[FAIL] %s: no attribute set\n", modelPath);
+        return false;
+    }
+    const size_t beforeAttrs = attrSet->GetNumberOfAttributes();
+
+    long long nPts = -1, nCells = -1;
+    {
+        auto ps = DynamicCast<iGame::PointSet>(mesh);
+        auto stm = DynamicCast<iGame::StructuredMesh>(mesh);
+        auto um = DynamicCast<iGame::UnstructuredMesh>(mesh);
+        auto sm = DynamicCast<iGame::SurfaceMesh>(mesh);
+        nPts = ps ? (long long)ps->GetNumberOfPoints() : -1;
+        if (stm) {
+            int s[3] = {0, 0, 0};
+            if (auto* sz = stm->GetDimensionSize()) { s[0] = sz[0]; s[1] = sz[1]; s[2] = sz[2]; }
+            nCells = 1;
+            if (s[0] > 1) nCells *= (s[0] - 1);
+            if (s[1] > 1) nCells *= (s[1] - 1);
+            if (s[2] > 1) nCells *= (s[2] - 1);
+        } else if (um) {
+            nCells = (long long)um->GetNumberOfCells();
+        } else if (sm) {
+            nCells = (long long)sm->GetNumberOfFaces();
+        }
+    }
+
+    auto filter = iGame::RandomAttributesFilter::New();
+    filter->SetInput(mesh);
+    filter->SetRange(minVal, maxVal);
+    filter->SetSeed(seed);
+    filter->SetAttachmentType(attachType);
+    filter->SetGenerateKind(kind);
+    if (!vectorName.empty()) filter->SetVectorName(vectorName);
+
+    if (!filter->Execute()) {
+        std::printf("[FAIL] %s: Execute() failed: %s\n",
+                    modelPath, filter->GetMessage().c_str());
+        return false;
+    }
+
+    // 验证原模型属性不变
+    if (mesh->GetAttributeSet()->GetNumberOfAttributes() != beforeAttrs) {
+        std::printf("[FAIL] %s: input model was modified\n", modelPath);
+        return false;
+    }
+
+    auto outAttrSet = filter->GetOutput() ? filter->GetOutput()->GetAttributeSet() : nullptr;
+    if (!outAttrSet) {
+        std::printf("[FAIL] %s: no output AttributeSet\n", modelPath);
+        return false;
+    }
+
+    const char* vecExpectedName = vectorName.empty()
+            ? (attachType == IG_CELL ? "RandomCellVectors" : "RandomPointVectors")
+            : vectorName.c_str();
+
+    // 按名称查找矢量数组（从后往前，兼容同名冲突改名后的情形）
+    int vecIdx = -1;
+    for (int i = (int)outAttrSet->GetNumberOfAttributes() - 1; i >= 0; --i) {
+        auto& ref = outAttrSet->GetAttribute(i);
+        if (!ref.pointer || ref.isDeleted) continue;
+        if (ref.attachmentType != attachType) continue;
+        if (ref.pointer->GetName() == std::string(vecExpectedName)) { vecIdx = i; break; }
+    }
+    if (vecIdx < 0) {
+        std::printf("[FAIL] %s: vector array '%s' not found\n", modelPath, vecExpectedName);
+        return false;
+    }
+
+    auto& vecAttr = outAttrSet->GetAttribute(vecIdx);
+    auto vecArr = DynamicCast<iGame::ArrayObject>(vecAttr.pointer);
+    if (!vecArr) {
+        std::printf("[FAIL] %s: vector attribute is not ArrayObject\n", modelPath);
+        return false;
+    }
+    const int dim = vecArr->GetDimension();
+    const IGsize nElem = vecArr->GetNumberOfElements();
+    const long long expected = (attachType == IG_CELL) ? nCells : nPts;
+    const bool dimOk = (dim == 3);
+    const bool countOk = ((long long)nElem == expected);
+    const bool typeOk = (vecAttr.type == IG_VECTOR);
+
+    std::printf("[%s] %s: kind=%s attach=%s vecName='%s' dim=%d nElem=%lld expected=%lld type=%s\n",
+                (dimOk && countOk && typeOk) ? "PASS" : "FAIL", modelPath, kindStr.c_str(),
+                attachStr.c_str(), vecArr->GetName().c_str(), dim, (long long)nElem, expected,
+                typeOk ? "IG_VECTOR" : "OTHER");
+
+    bool allOk = dimOk && countOk && typeOk;
+
+    if (kind == RandomAttributesFilter::GenerateKind::Both) {
+        // Both 模式还应同时存在标量数组（默认名）
+        const char* scName = (attachType == IG_CELL) ? "RandomCellScalars" : "RandomPointScalars";
+        int scIdx = -1;
+        for (int i = (int)outAttrSet->GetNumberOfAttributes() - 1; i >= 0; --i) {
+            auto& ref = outAttrSet->GetAttribute(i);
+            if (!ref.pointer || ref.isDeleted) continue;
+            if (ref.attachmentType != attachType) continue;
+            if (ref.pointer->GetName() == std::string(scName)) { scIdx = i; break; }
+        }
+        auto scArr = scIdx >= 0
+                ? DynamicCast<iGame::ArrayObject>(outAttrSet->GetAttribute(scIdx).pointer) : nullptr;
+        const bool scOk = scArr && scArr->GetDimension() == 1 &&
+                          (long long)scArr->GetNumberOfElements() == expected;
+        std::printf("[%s] Both mode: scalar '%s' dim=%d nElem=%lld\n",
+                    scOk ? "PASS" : "FAIL", scName,
+                    scArr ? scArr->GetDimension() : -1,
+                    scArr ? (long long)scArr->GetNumberOfElements() : -1);
+        return allOk && scOk;
+    }
+
+    return allOk;
+}
+
 
 int main(int argc, char* argv[]) {
     bool noRender = false;
@@ -216,6 +352,24 @@ int main(int argc, char* argv[]) {
         allPass &= ok5;
     }
 
+    // Test 6: 矢量生成（改进点5/6）：TetraMesh + Vector (POINT)
+    std::printf("\n--- Test 6: TetraMesh + Vector (POINT) ---\n");
+    allPass &= runVectorTest(kModel1, IG_POINT,
+                             RandomAttributesFilter::GenerateKind::Vector,
+                             0.0f, 10.0f, 5u);
+
+    // Test 7: 矢量生成：TetraMesh + Vector (CELL)
+    std::printf("\n--- Test 7: TetraMesh + Vector (CELL) ---\n");
+    allPass &= runVectorTest(kModel1, IG_CELL,
+                             RandomAttributesFilter::GenerateKind::Vector,
+                             -5.0f, 5.0f, 6u);
+
+    // Test 8: 标量 + 矢量同时生成（Both 模式）+ 自定义矢量名
+    std::printf("\n--- Test 8: StructuredGrid + Both (POINT, custom vector name) ---\n");
+    allPass &= runVectorTest(kModel2, IG_POINT,
+                             RandomAttributesFilter::GenerateKind::Both,
+                             0.0f, 100.0f, 8u, "MyRandomVectors");
+
     // Summary
     std::printf("\n============================================\n");
     std::printf("  Result: %s\n", allPass ? "ALL PASSED" : "SOME FAILED");
@@ -227,13 +381,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Render the last model with random scalars
-    auto mesh = iGame::FileIO::ReadFile(kModel2);
+    auto mesh = iGame::FileIO::ReadFile(kModel1);
     if (mesh) {
+        // 展示矢量生成效果：按矢量的第 0 分量着色
         auto filter = iGame::RandomAttributesFilter::New();
         filter->SetInput(mesh);
         filter->SetRange(0.0f, 255.0f);
         filter->SetSeed(7u);
         filter->SetAttachmentType(IG_POINT);
+        filter->SetGenerateKind(RandomAttributesFilter::GenerateKind::Vector);
         filter->Execute();
 
         auto output = filter->GetOutput();
@@ -243,7 +399,7 @@ int main(int argc, char* argv[]) {
         auto attrSet = output->GetAttributeSet();
         if (drawObj && attrSet) {
             int idx = (int)attrSet->GetNumberOfAttributes() - 1;
-            if (idx >= 0) drawObj->ViewCloudPicture(scene, idx);
+            if (idx >= 0) drawObj->ViewCloudPicture(scene, idx, 0);
         }
 
         auto window = iGame::RenderWindow::New();

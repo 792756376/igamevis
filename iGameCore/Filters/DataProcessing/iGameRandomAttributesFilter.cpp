@@ -138,6 +138,26 @@ ArrayObject::Pointer RandomAttributesFilter::CreateDataArray(IGsize num, double 
     }
 }
 
+// ---- 改进点6：矢量数组生成（对齐 ParaView Generate Point/Cell Vectors）----
+ArrayObject::Pointer RandomAttributesFilter::CreateVectorDataArray(IGsize num, double lo, double hi, unsigned int seed) {
+    switch (_dataType) {
+    case IG_CHAR:                    return CreateTypedVectorArray<CharArray, char>(num, lo, hi, seed);
+    case IG_UNSIGNED_CHAR:           return CreateTypedVectorArray<UnsignedCharArray, unsigned char>(num, lo, hi, seed);
+    case IG_SHORT:                   return CreateTypedVectorArray<ShortArray, short>(num, lo, hi, seed);
+    case IG_UNSIGNED_SHORT:          return CreateTypedVectorArray<UnsignedShortArray, unsigned short>(num, lo, hi, seed);
+    case IG_INT:
+    case IG_INDEX:                   return CreateTypedVectorArray<IntArray, int>(num, lo, hi, seed);
+    case IG_UNSIGNED_INT:            return CreateTypedVectorArray<UnsignedIntArray, unsigned int>(num, lo, hi, seed);
+    case IG_LONG_LONG:               return CreateTypedVectorArray<LongLongArray, long long>(num, lo, hi, seed);
+    case IG_UNSIGNED_LONG_LONG:      return CreateTypedVectorArray<UnsignedLongLongArray, unsigned long long>(num, lo, hi, seed);
+    case IG_FLOAT:                   return CreateTypedVectorArray<FloatArray, float>(num, lo, hi, seed);
+    case IG_DOUBLE:                  return CreateTypedVectorArray<DoubleArray, double>(num, lo, hi, seed);
+    default:
+        _msg = "不支持的数据类型。";
+        return nullptr;
+    }
+}
+
 // ---- 改进点4：修正二维结构网格的 Cell 计数 ----
 bool RandomAttributesFilter::ComputeCount(DataObject::Pointer input, IGsize& out, std::string& why) const {
     if (_attach == IG_POINT) {
@@ -183,17 +203,22 @@ bool RandomAttributesFilter::ComputeCount(DataObject::Pointer input, IGsize& out
     return false;
 }
 
-// ---- 改进点5：处理同名数组 ----
+// ---- 改进点5：处理同名数组（attrType 决定走 AddScalar 还是 AddVector）----
 bool RandomAttributesFilter::ApplyArrayToOutput(DataObject::Pointer output,
-    ArrayObject::Pointer data, const std::string& name, std::string& why)
+    ArrayObject::Pointer data, const std::string& name, IGenum attrType, std::string& why)
 {
     auto attrSet = output->GetAttributeSet();
     if (!attrSet) { why = "输出没有属性集。"; return false; }
 
     data->SetName(name);
 
+    auto addArray = [&](ArrayObject::Pointer arr) {
+        if (attrType == IG_VECTOR) attrSet->AddVector(_attach, arr);
+        else attrSet->AddScalar(_attach, arr);
+    };
+
     if (_conflictMode == NameConflictMode::Append) {
-        attrSet->AddScalar(_attach, data);
+        addArray(data);
         return true;
     }
 
@@ -209,7 +234,7 @@ bool RandomAttributesFilter::ApplyArrayToOutput(DataObject::Pointer output,
 
     if (existIdx < 0) {
         // 没有同名数组，直接添加
-        attrSet->AddScalar(_attach, data);
+        addArray(data);
         return true;
     }
 
@@ -217,7 +242,7 @@ bool RandomAttributesFilter::ApplyArrayToOutput(DataObject::Pointer output,
         // 替换已有同名数组
         auto& ref = attrSet->GetAttribute(existIdx);
         ref.pointer = data;
-        ref.type = IG_SCALAR;
+        ref.type = attrType;
         ref.attachmentType = _attach;
         return true;
     }
@@ -238,11 +263,11 @@ bool RandomAttributesFilter::ApplyArrayToOutput(DataObject::Pointer output,
             }
         } while (conflict);
         data->SetName(newName);
-        attrSet->AddScalar(_attach, data);
+        addArray(data);
         return true;
     }
 
-    attrSet->AddScalar(_attach, data);
+    addArray(data);
     return true;
 }
 
@@ -277,22 +302,30 @@ bool RandomAttributesFilter::Execute() {
 
     const double lo = (_max < _min) ? _max : _min;
     const double hi = (_max < _min) ? _min : _max;
+    // 矢量使用偏移后的种子，使标量与矢量序列相互独立
+    const unsigned int vecSeed = _seed + 1000003u;
 
-    auto data = CreateDataArray(num, lo, hi, _seed);
-    if (!data) return false;
-
-    // 确定属性名
-    std::string attrName;
-    if (!_name.empty()) {
-        attrName = _name;
-    } else {
-        attrName = (_attach == IG_POINT) ? "RandomPointScalars" : "RandomCellScalars";
+    // 改进点6：按生成类型生成标量 / 矢量（或两者）
+    if (_kind == GenerateKind::Scalar || _kind == GenerateKind::Both) {
+        auto data = CreateDataArray(num, lo, hi, _seed);
+        if (!data) return false;
+        std::string attrName = !_name.empty() ? _name
+                : (_attach == IG_POINT ? "RandomPointScalars" : "RandomCellScalars");
+        if (!ApplyArrayToOutput(output, data, attrName, IG_SCALAR, why)) {
+            _msg = why;
+            return false;
+        }
     }
 
-    // 改进点5：处理同名数组（替换/改名/追加）
-    if (!ApplyArrayToOutput(output, data, attrName, why)) {
-        _msg = why;
-        return false;
+    if (_kind == GenerateKind::Vector || _kind == GenerateKind::Both) {
+        auto data = CreateVectorDataArray(num, lo, hi, vecSeed);
+        if (!data) return false;
+        std::string vecName = !_vectorName.empty() ? _vectorName
+                : (_attach == IG_POINT ? "RandomPointVectors" : "RandomCellVectors");
+        if (!ApplyArrayToOutput(output, data, vecName, IG_VECTOR, why)) {
+            _msg = why;
+            return false;
+        }
     }
 
     SetOutput(output);
